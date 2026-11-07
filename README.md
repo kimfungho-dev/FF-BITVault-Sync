@@ -55,7 +55,7 @@ py bitvault_sync.py
 
 ## Button behaviour
 
-**Initialize Database** is the one-time setup. It creates `symbols`, `hourly_klines`, and `daily_fear_greed`, then downloads the full hourly history from 2026-09-01 00:00:00 UTC (or the earlier fallback if the exchange clock has not reached that date). The helper under the button says: "One-time setup: create tables + full history since 2026-09-01 UTC".
+**Initialize Database** is the only action that downloads the full history. It creates `symbols`, `hourly_klines`, and `daily_fear_greed`, then downloads the hourly history from 2026-09-01 00:00:00 UTC (or the earlier fallback if the exchange clock has not reached that date). Until that load has stored BTCUSDT rows, Initialize stays enabled and is the emphasized button. The helper says: "One-time setup: create tables + full history since 2026-09-01 UTC". The status line reads: "Start here: click Initialize Database to create tables and load history since 2026-09-01 UTC."
 
 If BTCUSDT already has rows, Initialize asks:
 
@@ -63,9 +63,9 @@ If BTCUSDT already has rows, Initialize asks:
 
 Yes runs the full download again. The primary key upsert refreshes existing hours instead of duplicating them. No leaves the database unchanged and writes `[INITIALIZE] Skipped by user: database already initialized.` to the activity log.
 
-**Sync Database** is the routine update. It reads `MAX(open_time)` and fetches only that hour plus any hours that have opened since. The helper under the button says: "Incremental: fetch only hours after the last stored record".
+**Sync Database** and **Auto-Sync** are enabled only after initialization. Before that they are greyed out, and the tooltip on both is "Initialize the database first". Sync never downloads the full history. It reads `MAX(open_time)` and fetches only that hour plus any hours that have opened since. The helper, once Sync is enabled, says: "Incremental: fetch only hours after the last stored record".
 
-If `hourly_klines` does not exist, or BTCUSDT has no rows, Sync does not fail. It logs that the database is not initialized and runs the full initialization itself. After that first load, later Sync clicks stay incremental.
+If `hourly_klines` does not exist, or BTCUSDT has no rows, Sync makes no kline requests. It logs `[SYNC] Skipped: database not initialized. Click Initialize Database first.` and returns. That skip is not a failure: the status line stays on the start-here message, and no error dialog opens.
 
 A badge beside the buttons reads SQLite when the window opens and again after every job:
 
@@ -83,7 +83,7 @@ Above the grid, while this view is selected: `LIVE = candle still forming; value
 
 ## Auto-Sync
 
-**Auto-Sync: OFF** sits to the right of **Sync Database** and is off when the window opens. Turning it on runs one incremental sync immediately, unless a job or a dialog is already open, then arms a Tk `after` timer for 5 minutes. The button reads `Auto-Sync: ON · next HH:MM:SS UTC`. When the timer fires it calls the same incremental sync as **Sync Database** and writes `[AUTO-SYNC]` to the activity log. If a job is already running, or a confirmation dialog is open, that tick is skipped and the next one is scheduled 5 minutes later. Turning it off cancels the timer.
+**Auto-Sync: OFF** sits to the right of **Sync Database**. It is off, and disabled, until Initialize has stored BTCUSDT rows. Turning it on before that does nothing. After initialization, turning it on runs one incremental sync immediately, unless a job or a dialog is already open, then arms a Tk `after` timer for 5 minutes. The button reads `Auto-Sync: ON · next HH:MM:SS UTC`. When the timer fires it calls the same incremental sync as **Sync Database** and writes `[AUTO-SYNC]` to the activity log. If a job is already running, or a confirmation dialog is open, that tick is skipped and the next one is scheduled 5 minutes later. If Auto-Sync is on and the warehouse is no longer initialized, it switches off and the log says why. Turning it off cancels the timer.
 
 ## Verify Integrity
 
@@ -296,7 +296,7 @@ Running Initialize again is safe. The primary key plus `ON CONFLICT DO UPDATE` r
 
 Fetching the whole history on every refresh is the wrong implementation. **Sync Database** asks SQLite what it already has, then asks Binance only for the tail.
 
-1. If `hourly_klines` does not exist, or `SELECT MAX(open_time) FROM hourly_klines WHERE symbol = 'BTCUSDT'` returns `NULL`, the log says the database is not initialized and the full load above runs instead.
+1. If `hourly_klines` does not exist, or `SELECT MAX(open_time) FROM hourly_klines WHERE symbol = 'BTCUSDT'` returns `NULL`, Sync stops. The log line is `[SYNC] Skipped: database not initialized. Click Initialize Database first.` No kline request is sent. The full download stays on **Initialize Database**.
 2. Otherwise the log records the exact line:
 
    ```text
@@ -324,6 +324,15 @@ After a sync inside the same clock hour, the BTCUSDT row count stays the same, `
 6. Click **Sync Database** once more. The same delta behaviour should repeat. The log must not show a second walk from 1 Sep 2026.
 
 The activity log is plain text. Select it and copy if you want to attach it to a report.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest tests/ -v
+```
+
+The suite uses a temporary database. It does not read or replace `bitvault.db` next to the script.
 
 ## Known limitations
 

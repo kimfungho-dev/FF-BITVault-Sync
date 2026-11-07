@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import os
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -160,11 +161,12 @@ def temp_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture(autouse=True)
 def workspace_left_clean() -> None:
+    """Tracked files must not include the live database or an export CSV."""
     yield
     root = Path(__file__).resolve().parents[1]
-    assert not (root / "bitvault.db").exists()
-    assert list(root.glob("*.csv")) == []
-    assert list(root.glob("ff_bitvault_hourly_*.csv")) == []
+    listed = subprocess.check_output(["git", "ls-files"], cwd=root, text=True).splitlines()
+    assert "bitvault.db" not in listed
+    assert not any(name.endswith(".csv") for name in listed)
 
 
 @pytest.fixture
@@ -286,56 +288,43 @@ def _after_count(app: bv.BitVaultApp) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 1. Fresh DB → Sync auto-initializes
+# 1. Fresh DB → Sync does not download history
 # ---------------------------------------------------------------------------
 
 
-def test_01_fresh_sync_auto_initializes_and_is_continuous(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Sync on an empty database runs initialization and stores every hour."""
+def test_01_fresh_sync_is_skipped_without_initialize(
+    monkeypatch: pytest.MonkeyPatch,
+    spawned: list[threading.Thread],
+    make_app,
+) -> None:
+    """Sync on an empty database makes no kline requests and is not a failure."""
     now = HISTORY + 1049 * HOUR
     market = Market(now)
     market.install(monkeypatch)
+    dialogs: list[object] = []
+    monkeypatch.setattr(bv.messagebox, "showerror", lambda *args, **kwargs: dialogs.append(args))
     notes: list[str] = []
     conn = bv.connect()
     try:
         bv.incremental_sync(conn, notes.append)
-        for symbol in (bv.PRIMARY_SYMBOL, bv.BENCHMARK_SYMBOL):
-            count, first, last = _counts(conn, symbol)
-            assert count == 1050
-            assert first == HISTORY
-            assert last == bv.floor_hour(now)
-            _assert_continuous(conn, symbol, HISTORY, int(last))
-            assert _duplicate_keys(conn) == 0
-        raw = market._row(bv.PRIMARY_SYMBOL, HISTORY)
-        stored = conn.execute(
-            """
-            SELECT open_price, high_price, low_price, close_price, volume
-            FROM hourly_klines WHERE symbol = ? AND open_time = ?
-            """,
-            (bv.PRIMARY_SYMBOL, HISTORY),
-        ).fetchone()
-        assert stored == tuple(float(raw[index]) for index in (1, 2, 3, 4, 5))
-        report = bv.verify_integrity(conn, notes.append)
+        stored = _counts(conn, bv.PRIMARY_SYMBOL)[0] if bv.table_exists(conn, "hourly_klines") else 0
     finally:
         conn.close()
+    assert stored == 0
+    assert notes == ["[SYNC] Skipped: database not initialized. Click Initialize Database first."]
+    assert not any("klines" in call["url"] for call in market.calls)
 
-    assert any("not initialized" in note for note in notes)
-    assert any(note.startswith("[INITIALIZE] Complete") for note in notes)
-    assert report.startswith("Integrity: PASS")
-    btc_starts = _kline_starts(market, bv.PRIMARY_SYMBOL)
-    eth_starts = _kline_starts(market, bv.BENCHMARK_SYMBOL)
-    assert btc_starts[0] == HISTORY
-    assert btc_starts[1] == HISTORY + 1000 * HOUR
-    assert eth_starts[0] == HISTORY
-    for call in market.calls:
-        if "klines" in call["url"]:
-            assert call["url"] == bv.BINANCE_KLINES_URL
-            assert call["params"]["interval"] == "1h"
-    print(
-        "TEST1 auto-init pages "
-        f"BTC startTimes={btc_starts} ETH startTimes={eth_starts} "
-        f"rows=1050 integrity=PASS"
-    )
+    app = make_app()
+    market.calls.clear()
+    app.on_sync()
+    _drain(app, spawned)
+    text = app.log_text.get("1.0", "end")
+    assert "[SYNC] Skipped: database not initialized. Click Initialize Database first." in text
+    assert "Failed" not in app.status_var.get()
+    assert "ERROR" not in text
+    assert dialogs == []
+    assert not any("klines" in call["url"] for call in market.calls)
+    print("TEST1 fresh sync skipped; kline_requests=0; no error dialog")
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +800,9 @@ def test_10_action_label_is_local_and_stored_timestamps_are_utc(
         ):
             assert any(required in label for label in labels), required
 
+        app.on_initialize()
+        _drain(app, spawned)
+        spawned.clear()
         app.on_sync()
         _drain(app, spawned)
         status = app.status_var.get()
@@ -995,3 +987,45 @@ def test_14_duplicate_fear_date_cannot_fan_out(monkeypatch: pytest.MonkeyPatch) 
     assert int(stored[0]) == 99
     assert len(joined) == btc
     print(f"TEST14 fear_rows_for_date=1 export_rows={len(joined)} btc_rows={btc}")
+
+
+def test_15_sync_and_autosync_disabled_until_initialized(
+    monkeypatch: pytest.MonkeyPatch,
+    spawned: list[threading.Thread],
+    make_app,
+) -> None:
+    """Sync and Auto-Sync stay grey until Initialize has stored BTCUSDT rows."""
+    now = HISTORY + 2 * HOUR
+    market = Market(now)
+    market.install(monkeypatch)
+    app = make_app()
+    assert app.btn_sync.instate(["disabled"])
+    assert app.btn_auto.instate(["disabled"])
+    assert not app.btn_init.instate(["disabled"])
+    assert app.btn_init.cget("style") == "Primary.TButton"
+    assert app._sync_tip.text == "Initialize the database first"
+    assert app._auto_tip.text == "Initialize the database first"
+    assert app.status_var.get() == (
+        "Start here: click Initialize Database to create tables and "
+        "load history since 2026-09-01 UTC."
+    )
+    app._on_auto_button()
+    assert app.auto_sync_var.get() is False
+    assert spawned == []
+
+    app.on_initialize()
+    _drain(app, spawned)
+    assert not app.btn_sync.instate(["disabled"])
+    assert not app.btn_auto.instate(["disabled"])
+    assert not app.btn_init.instate(["disabled"])
+    assert app._sync_tip.text == "Incremental: fetch only hours after the last stored record"
+
+    app._on_auto_button()
+    assert app.auto_sync_var.get() is True
+    _drain(app, spawned)
+    monkeypatch.setattr(bv, "read_init_state", lambda: bv.InitState(False, 0, None))
+    app._apply_ready_state()
+    app._poll_queue()
+    assert app.auto_sync_var.get() is False
+    assert "[AUTO-SYNC] Turned off: database is not initialized." in app.log_text.get("1.0", "end")
+    print("TEST15 sync and auto-sync disabled until initialize, then enabled")

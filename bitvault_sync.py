@@ -1302,25 +1302,18 @@ def incremental_sync(
     """Fetch only the candles from MAX(open_time) through the current hour.
 
     The last stored hour is requested again so the still-open candle is updated.
-    Older hours are not downloaded again.
+    Older hours are not downloaded again. An empty warehouse is not initialized
+    from here: that full download belongs only to Initialize Database.
     """
     progress(4, "Checking whether the database has been initialized...")
     if not table_exists(conn, "hourly_klines"):
-        log(
-            "Database is not initialized (hourly_klines does not exist). "
-            "Running initialization."
-        )
-        initialize_database(conn, log, progress)
+        log("[SYNC] Skipped: database not initialized. Click Initialize Database first.")
         return
 
     create_schema(conn, log)
     last_open = max_open_time(conn, PRIMARY_SYMBOL, log)
     if last_open is None:
-        log(
-            "Database is not initialized or BTCUSDT hourly_klines is empty. "
-            "Running initialization."
-        )
-        initialize_database(conn, log, progress)
+        log("[SYNC] Skipped: database not initialized. Click Initialize Database first.")
         return
 
     progress(10, "Reading Binance server time...")
@@ -1910,6 +1903,7 @@ class BitVaultApp(tk.Tk):
         self._build()
         self.after(80, self._poll_queue)
         self.refresh_dashboard()
+        self._apply_ready_state(announce=True)
         self._place_window()
 
     def _place_window(self) -> None:
@@ -1955,8 +1949,8 @@ class BitVaultApp(tk.Tk):
         )
         style.map(
             "Primary.TButton",
-            background=[("active", "#ffd45a"), ("disabled", "#6b5a20")],
-            foreground=[("disabled", "#2b2718")],
+            background=[("active", "#ffd45a"), ("disabled", "#3a3f46")],
+            foreground=[("disabled", "#8b949e")],
         )
         style.configure(
             "Secondary.TButton",
@@ -2005,8 +1999,8 @@ class BitVaultApp(tk.Tk):
         style.map(
             "AutoOff.TButton",
             background=[("active", "#102218"), ("disabled", BG)],
-            foreground=[("active", TEAL), ("disabled", "#1d4f49")],
-            bordercolor=[("active", TEAL), ("disabled", "#1d4f49")],
+            foreground=[("active", TEAL), ("disabled", "#6e7681")],
+            bordercolor=[("active", TEAL), ("disabled", "#3a3f46")],
         )
         style.configure(
             "AutoOn.TButton",
@@ -2201,12 +2195,12 @@ class BitVaultApp(tk.Tk):
             "One-time setup: create tables + full history since 2026-09-01 UTC",
             tip_font,
         )
-        HoverTip(
+        self._sync_tip = HoverTip(
             self.btn_sync,
             "Incremental: fetch only hours after the last stored record",
             tip_font,
         )
-        HoverTip(
+        self._auto_tip = HoverTip(
             self.btn_auto,
             "Run Sync Database every 5 minutes. A tick is skipped if a job is already running.",
             tip_font,
@@ -2426,8 +2420,44 @@ class BitVaultApp(tk.Tk):
 
     def _set_job_buttons(self, enabled: bool) -> None:
         state = ["!disabled"] if enabled else ["disabled"]
-        for button in (self.btn_init, self.btn_sync, self.btn_verify, self.btn_export):
+        for button in (self.btn_init, self.btn_sync, self.btn_verify, self.btn_export, self.btn_auto):
             button.state(state)
+
+    def _apply_ready_state(self, *, announce: bool = False) -> None:
+        """Sync and Auto-Sync stay off until BTCUSDT hourly history exists."""
+        if self._busy:
+            return
+        ready = read_init_state().initialized
+        self.btn_init.state(["!disabled"])
+        self.btn_init.configure(style="Primary.TButton")
+        self.btn_verify.state(["!disabled"])
+        self.btn_export.state(["!disabled"])
+        if ready:
+            self.btn_sync.state(["!disabled"])
+            self.btn_auto.state(["!disabled"])
+            self._sync_tip.text = "Incremental: fetch only hours after the last stored record"
+            self._auto_tip.text = (
+                "Run Sync Database every 5 minutes. A tick is skipped if a job is already running."
+            )
+            return
+        self.btn_sync.state(["disabled"])
+        self.btn_auto.state(["disabled"])
+        self._sync_tip.text = "Initialize the database first"
+        self._auto_tip.text = "Initialize the database first"
+        if self.auto_sync_var.get():
+            self.auto_sync_var.set(False)
+            self._cancel_auto_sync()
+            self._next_auto_at = None
+            self._paint_auto_button()
+            self.log(
+                "[AUTO-SYNC] Turned off: database is not initialized. "
+                "Click Initialize Database first."
+            )
+        if announce:
+            self.status_var.set(
+                "Start here: click Initialize Database to create tables and "
+                "load history since 2026-09-01 UTC."
+            )
 
     def _toggle_log(self) -> None:
         self._log_open = not self._log_open
@@ -2535,6 +2565,8 @@ class BitVaultApp(tk.Tk):
         self._start_job(self._export_job, "Running: Export CSV...", "export")
 
     def _on_auto_button(self) -> None:
+        if not read_init_state().initialized:
+            return
         turning_on = not self.auto_sync_var.get()
         self.auto_sync_var.set(turning_on)
         self._on_auto_sync_toggle()
@@ -2582,6 +2614,9 @@ class BitVaultApp(tk.Tk):
             return
         if self._busy:
             self.log("[AUTO-SYNC] Skipped: a job is already running.")
+            return
+        if not read_init_state().initialized:
+            self._apply_ready_state()
             return
         self.log("[AUTO-SYNC]")
         self._start_job(self._sync_job, "Running: Sync Database...", "sync")
@@ -2683,6 +2718,7 @@ class BitVaultApp(tk.Tk):
         self._remember_action(self._action_summary(kind, notes, report, elapsed, error))
         self._paint_auto_button()
         self.refresh_dashboard()
+        self._apply_ready_state()
         if error:
             if not self._log_open:
                 self._toggle_log()
@@ -2715,6 +2751,11 @@ class BitVaultApp(tk.Tk):
             if error or not self._export_path:
                 return f"Last Export: {clock} · Failed"
             return f"Last Export: {clock} · {os.path.basename(self._export_path)}"
+        if any(note.startswith("[SYNC] Skipped:") for note in notes) and not error:
+            return (
+                "Start here: click Initialize Database to create tables and "
+                "load history since 2026-09-01 UTC."
+            )
         counts = written_counts(notes)
         if kind == "initialize":
             if error or counts is None:
