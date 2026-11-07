@@ -13,6 +13,7 @@ import os
 import queue
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -90,6 +91,43 @@ def format_utc_label(timestamp_ms: int | None) -> str:
     if timestamp_ms is None:
         return "—"
     return f"{format_utc(timestamp_ms)} UTC"
+
+
+def footer_host_label() -> str:
+    """Hostname of the spot host in use. Vision is marked as the fallback."""
+    name = _session_host.replace("https://", "").replace("http://", "").strip("/")
+    if name == "data-api.binance.vision":
+        return "data-api.binance.vision (fallback)"
+    return "api.binance.com"
+
+
+def app_version() -> str:
+    """Short git commit of this file, or v1.0 when git cannot answer."""
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        completed = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "v1.0"
+    short = completed.stdout.strip()
+    if completed.returncode != 0 or not short or any(char.isspace() for char in short):
+        return "v1.0"
+    return short
+
+
+def footer_status() -> str:
+    """Absolute database path, size, current spot host, and version."""
+    path = os.path.abspath(DB_FILE)
+    try:
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+    except OSError:
+        size_mb = 0.0
+    return f"{path} · {size_mb:.2f} MB · API host: {footer_host_label()} · {app_version()}"
 
 
 def floor_hour(timestamp_ms: int) -> int:
@@ -1753,7 +1791,7 @@ def continuity_label(missing_hours: int | None) -> str:
 
 
 MARKET_COLUMNS = (
-    ("open_time", "Open Time (UTC)", 156, "w", True),
+    ("open_time", "Open Time (UTC)", 196, "w", False),
     ("open", "Open (USDT)", 108, "e", False),
     ("high", "High (USDT)", 108, "e", False),
     ("low", "Low (USDT)", 108, "e", False),
@@ -2356,12 +2394,13 @@ class BitVaultApp(tk.Tk):
             self.log_text.tag_configure(name, foreground=color)
         self.log_wrap.grid_remove()
 
+        self.footer_var = tk.StringVar(value=footer_status())
         tk.Label(
             shell,
-            text="bitvault.db    ·    spot 1h OHLCV    ·    taker order flow    ·    daily fear & greed",
+            textvariable=self.footer_var,
             bg=BG,
             fg=MUTED,
-            font=(self.ui_font, 10),
+            font=(self.ui_font, 9),
             anchor="w",
         ).grid(row=7, column=0, sticky="ew", pady=(8, 0))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -2719,6 +2758,7 @@ class BitVaultApp(tk.Tk):
         self._paint_auto_button()
         self.refresh_dashboard()
         self._apply_ready_state()
+        self._refresh_footer()
         if error:
             if not self._log_open:
                 self._toggle_log()
@@ -2871,12 +2911,28 @@ class BitVaultApp(tk.Tk):
     def _on_view_change(self) -> None:
         self._render_active_view()
 
+    def _open_time_column_width(self) -> int:
+        """Pixel width that fits YYYY-MM-DD HH:MM:SS and the Open Time heading."""
+        sample = "2026-09-01 00:00:00"
+        body = tkfont.Font(self, font=(self.ui_font, 11))
+        heading = tkfont.Font(self, font=(self.ui_font, 10, "bold"))
+        text = max(body.measure(sample), heading.measure("Open Time (UTC)"))
+        return text + 28
+
+    def _refresh_footer(self) -> None:
+        self.footer_var.set(footer_status())
+
     def _apply_columns(self, specs: tuple) -> None:
         names = [spec[0] for spec in specs]
         self.tree.configure(columns=names, displaycolumns=names)
+        open_time_floor = self._open_time_column_width()
         for name, heading, width, anchor, stretch in specs:
+            floor = 64
+            if name == "open_time":
+                floor = open_time_floor
+                width = max(width, floor)
             self.tree.heading(name, text=heading, anchor="center")
-            self.tree.column(name, width=width, minwidth=64, anchor=anchor, stretch=stretch)
+            self.tree.column(name, width=width, minwidth=floor, anchor=anchor, stretch=stretch)
 
     def _render_active_view(self) -> None:
         view = self.view_var.get()
