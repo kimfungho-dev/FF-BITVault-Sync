@@ -2,3 +2,4 @@ bitvault.db
 bitvault_backup.db
 __pycache__/
 .DS_Store
+ff_bitvault_hourly_*.csv

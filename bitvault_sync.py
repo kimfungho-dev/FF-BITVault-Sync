@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import os
 import queue
+import re
 import sqlite3
 import sys
 import threading
@@ -1669,6 +1670,95 @@ VIEW_LABELS = (
 )
 
 
+def action_clock() -> str:
+    """Local time with its timezone label, then the same instant in UTC."""
+    local = datetime.now().astimezone()
+    utc = datetime.now(timezone.utc)
+    zone = local.tzname() or "local"
+    return f"{local.strftime('%H:%M:%S')} {zone} ({utc.strftime('%H:%M:%S')} UTC)"
+
+
+def written_counts(notes: list[str]) -> tuple[int, int] | None:
+    """Sum new/updated counts from the existing initialize or sync summary line."""
+    line = ""
+    for note in notes:
+        if note.startswith("[INCREMENTAL SYNC] Synced") or note.startswith("[INITIALIZE] Complete"):
+            line = note
+    if not line:
+        return None
+    pairs = re.findall(r"new=(\d+) updated=(\d+)", line)
+    if not pairs:
+        return None
+    new = sum(int(item[0]) for item in pairs)
+    updated = sum(int(item[1]) for item in pairs)
+    return new, updated
+
+
+def integrity_headline(report: str) -> str:
+    """PASS, or FAIL with the number of checks that were not clean."""
+    if report.startswith("Integrity: PASS"):
+        return "PASS"
+    issues = 0
+    for line in report.splitlines():
+        if line.startswith("Integrity:"):
+            continue
+        expect = re.search(r":\s*([\d,]+)\s*\(expect 0\)", line)
+        if expect:
+            if int(expect.group(1).replace(",", "")) > 0:
+                issues += 1
+            continue
+        span = re.search(r"actual\s+([\d,]+),\s+expected\s+([\d,]+)", line)
+        if span:
+            actual = int(span.group(1).replace(",", ""))
+            expected = int(span.group(2).replace(",", ""))
+            if actual != expected:
+                issues += 1
+            continue
+        if "empty" in line or "no rows" in line:
+            issues += 1
+    return f"FAIL ({max(issues, 1)} issues)"
+
+
+class HoverTip:
+    """Small hover label. Tk has no built-in tooltip."""
+
+    def __init__(self, widget: tk.Widget, text: str, font: tuple) -> None:
+        self.widget = widget
+        self.text = text
+        self.font = font
+        self.tip: tk.Toplevel | None = None
+        widget.bind("<Enter>", self.show, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+
+    def show(self, _event: object = None) -> None:
+        if self.tip is not None:
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.configure(bg="#1c2430")
+        tk.Label(
+            tip,
+            text=self.text,
+            bg="#1c2430",
+            fg=FG,
+            font=self.font,
+            padx=8,
+            pady=4,
+            justify="left",
+        ).pack()
+        tip.update_idletasks()
+        x = self.widget.winfo_rootx()
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        tip.wm_geometry(f"+{x}+{y}")
+        self.tip = tip
+
+    def hide(self, _event: object = None) -> None:
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
 class BitVaultApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1682,8 +1772,13 @@ class BitVaultApp(tk.Tk):
         self._busy = False
         self._closing = False
         self._auto_after_id: str | None = None
+        self._next_auto_at: datetime | None = None
         self.auto_sync_var = tk.BooleanVar(value=False)
-        self.next_auto_var = tk.StringVar(value="")
+        self._job_notes: list[str] = []
+        self._job_kind = ""
+        self._job_started = 0.0
+        self._verify_report = ""
+        self._log_open = False
         self._apply_theme()
         self._build()
         self.after(80, self._poll_queue)
@@ -1751,12 +1846,67 @@ class BitVaultApp(tk.Tk):
             foreground=[("disabled", "#d7fffa")],
         )
         style.configure(
+            "Outline.TButton",
+            font=(self.ui_font, 11, "bold"),
+            foreground=FG,
+            background=BG,
+            bordercolor="#8b949e",
+            lightcolor=BG,
+            darkcolor=BG,
+            borderwidth=1,
+            padding=(14, 8),
+            focuscolor=BG,
+        )
+        style.map(
+            "Outline.TButton",
+            background=[("active", "#21262d"), ("disabled", BG)],
+            foreground=[("active", FG), ("disabled", MUTED)],
+            bordercolor=[("active", FG), ("disabled", "#30363d")],
+        )
+        style.configure(
+            "AutoOff.TButton",
+            font=(self.ui_font, 11, "bold"),
+            foreground=TEAL,
+            background=BG,
+            bordercolor=TEAL,
+            lightcolor=BG,
+            darkcolor=BG,
+            borderwidth=1,
+            padding=(14, 8),
+            focuscolor=BG,
+        )
+        style.map(
+            "AutoOff.TButton",
+            background=[("active", "#102218"), ("disabled", BG)],
+            foreground=[("active", TEAL), ("disabled", "#1d4f49")],
+            bordercolor=[("active", TEAL), ("disabled", "#1d4f49")],
+        )
+        style.configure(
+            "AutoOn.TButton",
+            font=(self.ui_font, 11, "bold"),
+            foreground="#04221e",
+            background=TEAL,
+            bordercolor=TEAL,
+            lightcolor=TEAL,
+            darkcolor=TEAL,
+            borderwidth=0,
+            padding=(14, 8),
+            focuscolor=TEAL,
+        )
+        style.map(
+            "AutoOn.TButton",
+            background=[("active", "#5ef0dc"), ("disabled", "#1d4f49")],
+            foreground=[("disabled", "#d7fffa")],
+        )
+        style.configure(
             "Gold.Horizontal.TProgressbar",
             troughcolor="#21262d",
             background=GOLD,
             bordercolor="#21262d",
             lightcolor=GOLD,
             darkcolor=GOLD,
+            thickness=4,
+            borderwidth=0,
         )
         style.configure(
             "BitVault.Treeview",
@@ -1767,13 +1917,59 @@ class BitVaultApp(tk.Tk):
             rowheight=28,
             font=(self.ui_font, 11),
         )
+        # Clam paints headings with a light image. A wide stretched column
+        # (Market Regime / Classification) shows that image as a white bar.
+        # A solid cell image keeps every heading on the same dark fill.
+        self._heading_fill = tk.PhotoImage(width=8, height=8)
+        self._heading_fill.put("#1c2430", to=(0, 0, 8, 8))
+        style.element_create(
+            "BitVault.Treeheading.cell",
+            "image",
+            self._heading_fill,
+            border=1,
+            sticky="nswe",
+        )
+        style.layout(
+            "BitVault.Treeview.Heading",
+            [
+                ("BitVault.Treeheading.cell", {"sticky": "nswe"}),
+                (
+                    "Treeheading.border",
+                    {
+                        "sticky": "nswe",
+                        "children": [
+                            (
+                                "Treeheading.padding",
+                                {
+                                    "sticky": "nswe",
+                                    "children": [
+                                        ("Treeheading.text", {"sticky": "we"}),
+                                    ],
+                                },
+                            )
+                        ],
+                    },
+                ),
+            ],
+        )
         style.configure(
             "BitVault.Treeview.Heading",
             background="#1c2430",
             foreground=GOLD,
+            bordercolor="#1c2430",
+            lightcolor="#1c2430",
+            darkcolor="#1c2430",
             borderwidth=0,
             relief="flat",
             font=(self.ui_font, 10, "bold"),
+        )
+        style.map(
+            "BitVault.Treeview.Heading",
+            background=[("active", "#1c2430"), ("pressed", "#1c2430")],
+            foreground=[("active", GOLD), ("pressed", GOLD)],
+            bordercolor=[("active", "#1c2430"), ("pressed", "#1c2430")],
+            lightcolor=[("active", "#1c2430"), ("pressed", "#1c2430")],
+            darkcolor=[("active", "#1c2430"), ("pressed", "#1c2430")],
         )
         style.map(
             "BitVault.Treeview",
@@ -1792,33 +1988,46 @@ class BitVaultApp(tk.Tk):
         shell = tk.Frame(self, bg=BG)
         shell.pack(fill="both", expand=True, padx=20, pady=16)
         shell.columnconfigure(0, weight=1)
-        # The log's natural request is tall. Pin both panes so the preview
-        # cannot be squeezed down to its border when the window is shorter
-        # than the sum of those requests.
-        shell.rowconfigure(4, weight=3, minsize=240)
-        shell.rowconfigure(6, weight=2, minsize=150)
+        shell.rowconfigure(4, weight=1)
 
         header = tk.Frame(shell, bg=BG)
         header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        titles = tk.Frame(header, bg=BG)
+        titles.grid(row=0, column=0, sticky="ew")
         tk.Label(
-            header,
+            titles,
             text="FF-BITVAULT-SYNC",
             bg=BG,
             fg=GOLD,
             font=(self.ui_font, 22, "bold"),
         ).pack(anchor="w")
         tk.Label(
-            header,
+            titles,
             text="Automated Spot OHLCV, Order-Flow Microstructure & Macro Sentiment Ingestion Engine",
             bg=BG,
             fg=FG,
             font=(self.ui_font, 12),
         ).pack(anchor="w", pady=(2, 0))
-        tk.Frame(header, bg=GOLD, height=2).pack(fill="x", pady=(12, 0))
+        self.badge_var = tk.StringVar(value="● Not initialized")
+        self.badge_label = tk.Label(
+            header,
+            textvariable=self.badge_var,
+            bg="#3a1518",
+            fg=RED,
+            font=(self.ui_font, 11, "bold"),
+            anchor="center",
+            padx=12,
+            pady=6,
+        )
+        self.badge_label.grid(row=0, column=1, sticky="ne", padx=(16, 0))
+        tk.Frame(header, bg=GOLD, height=2).grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0)
+        )
 
         toolbar = tk.Frame(shell, bg=BG)
         toolbar.grid(row=1, column=0, sticky="ew", pady=(14, 8))
-        toolbar.columnconfigure(4, weight=1)
+        toolbar.columnconfigure(3, weight=1)
         self.btn_init = ttk.Button(
             toolbar,
             text="Initialize Database",
@@ -1830,82 +2039,62 @@ class BitVaultApp(tk.Tk):
         self.btn_sync = ttk.Button(
             toolbar,
             text="Sync Database",
-            style="Secondary.TButton",
+            style="Primary.TButton",
             command=self.on_sync,
             cursor="hand2",
         )
         self.btn_sync.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self.btn_auto = ttk.Button(
+            toolbar,
+            text="Auto-Sync: OFF",
+            style="AutoOff.TButton",
+            command=self._on_auto_button,
+            cursor="hand2",
+        )
+        self.btn_auto.grid(row=0, column=2, sticky="w", padx=(0, 8))
         self.btn_verify = ttk.Button(
             toolbar,
             text="Verify Integrity",
-            style="Secondary.TButton",
+            style="Outline.TButton",
             command=self.on_verify,
             cursor="hand2",
         )
-        self.btn_verify.grid(row=0, column=2, sticky="w", padx=(0, 8))
+        self.btn_verify.grid(row=0, column=4, sticky="e", padx=(8, 8))
         self.btn_export = ttk.Button(
             toolbar,
             text="Export CSV",
-            style="Secondary.TButton",
+            style="Outline.TButton",
             command=self.on_export,
             cursor="hand2",
         )
-        self.btn_export.grid(row=0, column=3, sticky="w", padx=(0, 8))
-        tk.Label(
-            toolbar,
-            text="One-time setup: create tables + full history since 2026-09-01 UTC",
-            bg=BG,
-            fg=MUTED,
-            font=(self.ui_font, 10),
-            anchor="w",
-            justify="left",
-            wraplength=320,
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        tk.Label(
-            toolbar,
-            text="Incremental: fetch only hours after the last stored record",
-            bg=BG,
-            fg=MUTED,
-            font=(self.ui_font, 10),
-            anchor="w",
-            justify="left",
-            wraplength=320,
-        ).grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
-        tk.Checkbutton(
-            toolbar,
-            text="Auto-Sync every 5 min",
-            variable=self.auto_sync_var,
-            command=self._on_auto_sync_toggle,
-            bg=BG,
-            fg=FG,
-            selectcolor="#21262d",
-            activebackground=BG,
-            activeforeground=FG,
-            font=(self.ui_font, 11, "bold"),
-            highlightthickness=0,
-            anchor="w",
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        tk.Label(
-            toolbar,
-            textvariable=self.next_auto_var,
-            bg=BG,
-            fg=AMBER,
-            font=(self.ui_font, 11),
-            anchor="w",
-        ).grid(row=2, column=2, columnspan=2, sticky="w", pady=(8, 0))
-        self.badge_var = tk.StringVar(value="● Not initialized — click Initialize Database first")
-        self.badge_label = tk.Label(
-            toolbar,
-            textvariable=self.badge_var,
-            bg=BG,
-            fg=RED,
-            font=(self.ui_font, 11, "bold"),
-            anchor="w",
-            justify="left",
-            wraplength=360,
+        self.btn_export.grid(row=0, column=5, sticky="e")
+        tip_font = (self.ui_font, 10)
+        HoverTip(
+            self.btn_init,
+            "One-time setup: create tables + full history since 2026-09-01 UTC",
+            tip_font,
         )
-        self.badge_label.grid(row=0, column=4, rowspan=2, sticky="w", padx=(12, 0))
-        self.status_var = tk.StringVar(value="Ready.")
+        HoverTip(
+            self.btn_sync,
+            "Incremental: fetch only hours after the last stored record",
+            tip_font,
+        )
+        HoverTip(
+            self.btn_auto,
+            "Run Sync Database every 5 minutes. A tick is skipped if a job is already running.",
+            tip_font,
+        )
+        HoverTip(
+            self.btn_verify,
+            "Read-only check for duplicate keys, hourly gaps, expected row counts, and Fear & Greed dates.",
+            tip_font,
+        )
+        HoverTip(
+            self.btn_export,
+            "Save the joined hourly analysis table as CSV.",
+            tip_font,
+        )
+        self.status_var = tk.StringVar(value="No actions yet this session.")
         tk.Label(
             toolbar,
             textvariable=self.status_var,
@@ -1913,14 +2102,17 @@ class BitVaultApp(tk.Tk):
             fg=FG,
             font=(self.ui_font, 11),
             anchor="w",
-        ).grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        ).grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 0))
         self.progress_var = tk.DoubleVar(value=0)
-        ttk.Progressbar(
+        self.progress_canvas = tk.Canvas(
             toolbar,
-            style="Gold.Horizontal.TProgressbar",
-            variable=self.progress_var,
-            maximum=100,
-        ).grid(row=4, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+            height=4,
+            bg="#21262d",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.progress_canvas.grid(row=2, column=0, columnspan=6, sticky="ew", pady=(6, 0))
+        self.progress_canvas.grid_remove()
 
         metrics = tk.Frame(shell, bg=BG)
         metrics.grid(row=2, column=0, sticky="ew", pady=(8, 12))
@@ -1980,7 +2172,7 @@ class BitVaultApp(tk.Tk):
             columns=[item[0] for item in MARKET_COLUMNS],
             show="headings",
             style="BitVault.Treeview",
-            height=8,
+            height=12,
         )
         self._apply_columns(MARKET_COLUMNS)
         self.tree.tag_configure("up", background="#102218", foreground="#3dd68c")
@@ -1997,15 +2189,20 @@ class BitVaultApp(tk.Tk):
         self.tree.grid(row=1, column=0, sticky="nsew")
         table_scroll.grid(row=1, column=1, sticky="ns")
 
-        tk.Label(
+        self.log_toggle = tk.Label(
             shell,
-            text="Activity Log",
+            text="▸ Activity Log",
             bg=BG,
             fg=FG,
             font=(self.ui_font, 13, "bold"),
-        ).grid(row=5, column=0, sticky="w", pady=(12, 6))
+            anchor="w",
+            cursor="hand2",
+        )
+        self.log_toggle.bind("<Button-1>", lambda _event: self._toggle_log())
+        self.log_toggle.grid(row=5, column=0, sticky="w", pady=(12, 6))
 
         log_wrap = tk.Frame(shell, bg=LOG_BG, highlightthickness=1, highlightbackground=CARD_EDGE)
+        self.log_wrap = log_wrap
         log_wrap.grid(row=6, column=0, sticky="nsew")
         log_wrap.rowconfigure(0, weight=1)
         log_wrap.columnconfigure(0, weight=1)
@@ -2019,7 +2216,7 @@ class BitVaultApp(tk.Tk):
             highlightthickness=0,
             padx=12,
             pady=8,
-            height=7,
+            height=6,
             wrap="word",
             state="disabled",
         )
@@ -2036,6 +2233,7 @@ class BitVaultApp(tk.Tk):
             ("error", RED),
         ):
             self.log_text.tag_configure(name, foreground=color)
+        self.log_wrap.grid_remove()
 
         tk.Label(
             shell,
@@ -2104,6 +2302,47 @@ class BitVaultApp(tk.Tk):
         for button in (self.btn_init, self.btn_sync, self.btn_verify, self.btn_export):
             button.state(state)
 
+    def _toggle_log(self) -> None:
+        self._log_open = not self._log_open
+        if self._log_open:
+            self.log_toggle.configure(text="▾ Activity Log")
+            self.log_wrap.grid()
+        else:
+            self.log_toggle.configure(text="▸ Activity Log")
+            self.log_wrap.grid_remove()
+
+    def _show_progress(self) -> None:
+        self.progress_canvas.grid()
+        self.after_idle(lambda: self._set_progress(float(self.progress_var.get())))
+
+    def _hide_progress(self) -> None:
+        self.progress_var.set(0)
+        self.progress_canvas.delete("all")
+        self.progress_canvas.grid_remove()
+
+    def _set_progress(self, percent: float) -> None:
+        self.progress_var.set(percent)
+        canvas = self.progress_canvas
+        canvas.update_idletasks()
+        width = canvas.winfo_width()
+        if width <= 1:
+            width = max(canvas.winfo_reqwidth(), 1)
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, max(0, width * (percent / 100.0)), 4, fill=GOLD, width=0)
+
+    def _paint_auto_button(self) -> None:
+        if self.auto_sync_var.get() and self._next_auto_at is not None:
+            stamp = self._next_auto_at.strftime("%H:%M:%S")
+            self.btn_auto.configure(
+                text=f"Auto-Sync: ON · next {stamp} UTC",
+                style="AutoOn.TButton",
+            )
+            return
+        self.btn_auto.configure(text="Auto-Sync: OFF", style="AutoOff.TButton")
+
+    def _remember_action(self, text: str) -> None:
+        self.status_var.set(text)
+
     def on_initialize(self) -> None:
         state = read_init_state()
         if state.initialized and state.last_open_ms is not None:
@@ -2116,21 +2355,19 @@ class BitVaultApp(tk.Tk):
             if not messagebox.askyesno("Initialize Database", prompt, parent=self):
                 self.log("[INITIALIZE] Skipped by user: database already initialized.")
                 return
-        self._start_job(self._initialize_job, "Initializing database...")
+        self._start_job(self._initialize_job, "Running: Initialize Database...", "initialize")
 
     def _update_init_badge(self) -> None:
         state = read_init_state()
         if not state.initialized:
-            self.badge_var.set("● Not initialized — click Initialize Database first")
-            self.badge_label.configure(fg=RED)
+            self.badge_var.set("● Not initialized")
+            self.badge_label.configure(fg=RED, bg="#3a1518")
             return
-        self.badge_var.set(
-            f"● Initialized · {state.btc_count:,} BTCUSDT rows · use Sync Database for updates"
-        )
-        self.badge_label.configure(fg=GREEN)
+        self.badge_var.set(f"● Initialized · {state.btc_count:,} rows")
+        self.badge_label.configure(fg=GREEN, bg="#102218")
 
     def on_sync(self) -> None:
-        self._start_job(self._sync_job, "Syncing database...")
+        self._start_job(self._sync_job, "Running: Sync Database...", "sync")
 
     def on_verify(self) -> None:
         if self._busy:
@@ -2139,7 +2376,7 @@ class BitVaultApp(tk.Tk):
         if not os.path.exists(DB_FILE):
             messagebox.showinfo("Verify Integrity", "bitvault.db does not exist yet.", parent=self)
             return
-        self._start_job(self._verify_job, "Verifying integrity...")
+        self._start_job(self._verify_job, "Running: Verify Integrity...", "verify")
 
     def on_export(self) -> None:
         if self._busy:
@@ -2158,11 +2395,24 @@ class BitVaultApp(tk.Tk):
         )
         if not path:
             return
+        self._remember_action("Running: Export CSV...")
+        self._show_progress()
+        self._set_progress(15)
+        self.update_idletasks()
         try:
             export_hourly_csv(path, self.log)
         except OSError as exc:
+            self._hide_progress()
             self.log(f"ERROR: export failed: {exc}")
+            self._remember_action(f"Last Export: {action_clock()} · Failed")
             messagebox.showerror("Export CSV", str(exc), parent=self)
+            return
+        self._hide_progress()
+        self._remember_action(f"Last Export: {action_clock()} · {os.path.basename(path)}")
+
+    def _on_auto_button(self) -> None:
+        self.auto_sync_var.set(not self.auto_sync_var.get())
+        self._on_auto_sync_toggle()
 
     def _on_auto_sync_toggle(self) -> None:
         if self.auto_sync_var.get():
@@ -2170,16 +2420,18 @@ class BitVaultApp(tk.Tk):
             self.log("[AUTO-SYNC] Enabled. Incremental sync runs every 5 minutes.")
         else:
             self._cancel_auto_sync()
-            self.next_auto_var.set("")
+            self._next_auto_at = None
+            self._paint_auto_button()
             self.log("[AUTO-SYNC] Disabled. Timer cancelled.")
 
     def _schedule_auto_sync(self) -> None:
         self._cancel_auto_sync()
         if self._closing or not self.auto_sync_var.get():
-            self.next_auto_var.set("")
+            self._next_auto_at = None
+            self._paint_auto_button()
             return
-        next_at = datetime.now(timezone.utc) + timedelta(milliseconds=AUTO_SYNC_INTERVAL_MS)
-        self.next_auto_var.set(f"Next auto-sync: {next_at.strftime('%H:%M:%S')} UTC")
+        self._next_auto_at = datetime.now(timezone.utc) + timedelta(milliseconds=AUTO_SYNC_INTERVAL_MS)
+        self._paint_auto_button()
         self._auto_after_id = self.after(AUTO_SYNC_INTERVAL_MS, self._auto_sync_tick)
 
     def _cancel_auto_sync(self) -> None:
@@ -2193,24 +2445,30 @@ class BitVaultApp(tk.Tk):
     def _auto_sync_tick(self) -> None:
         self._auto_after_id = None
         if self._closing or not self.auto_sync_var.get():
-            self.next_auto_var.set("")
+            self._next_auto_at = None
+            self._paint_auto_button()
             return
         self._schedule_auto_sync()
         if self._busy:
             self.log("[AUTO-SYNC] Skipped: a job is already running.")
             return
         self.log("[AUTO-SYNC]")
-        self._start_job(self._sync_job, "Auto-syncing database...")
+        self._start_job(self._sync_job, "Running: Sync Database...", "sync")
 
-    def _start_job(self, target: Callable[[], None], status: str) -> None:
+    def _start_job(self, target: Callable[[], None], status: str, kind: str) -> None:
         if self._busy:
             self.log("A database job is already running.")
             return
         self._busy = True
+        self._job_kind = kind
+        self._job_started = time.perf_counter()
+        self._job_notes = []
+        self._verify_report = ""
         self.configure(cursor="watch")
         self._set_job_buttons(False)
-        self.progress_var.set(2)
-        self.status_var.set(status)
+        self._remember_action(status)
+        self._show_progress()
+        self._set_progress(2)
         threading.Thread(target=self._wrap_job, args=(target,), name="bitvault-sync", daemon=True).start()
 
     def _wrap_job(self, target: Callable[[], None]) -> None:
@@ -2245,9 +2503,12 @@ class BitVaultApp(tk.Tk):
             report = verify_integrity(conn, self.log)
         finally:
             conn.close()
+        self._verify_report = report
         self._queue.put(("dialog", "Verify Integrity", report))
 
     def log(self, message: str) -> None:
+        if self._busy:
+            self._job_notes.append(message)
         stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         line = f"[{stamp} UTC] {message}"
         print(line, flush=True)
@@ -2266,8 +2527,7 @@ class BitVaultApp(tk.Tk):
                 if kind == "log":
                     self._append_log(item[1])
                 elif kind == "progress":
-                    self.progress_var.set(item[1])
-                    self.status_var.set(item[2])
+                    self._set_progress(item[1])
                 elif kind == "dialog":
                     messagebox.showinfo(item[1], item[2], parent=self)
                 elif kind == "done":
@@ -2278,13 +2538,42 @@ class BitVaultApp(tk.Tk):
             self.after(80, self._poll_queue)
 
     def _finish_job(self, error: str | None) -> None:
+        elapsed = max(0.0, time.perf_counter() - self._job_started)
+        notes = list(self._job_notes)
+        kind = self._job_kind
+        report = self._verify_report
         self._busy = False
         self.configure(cursor="")
         self._set_job_buttons(True)
-        if error:
-            self.progress_var.set(0)
-            self.status_var.set(f"Failed: {error}")
+        self._hide_progress()
+        self._remember_action(self._action_summary(kind, notes, report, elapsed, error))
+        self._paint_auto_button()
         self.refresh_dashboard()
+
+    def _action_summary(
+        self,
+        kind: str,
+        notes: list[str],
+        report: str,
+        elapsed: float,
+        error: str | None,
+    ) -> str:
+        clock = action_clock()
+        duration = f"{elapsed:.1f} s"
+        if kind == "verify":
+            if error:
+                return f"Last Integrity Check: {clock} · Failed"
+            return f"Last Integrity Check: {clock} · {integrity_headline(report)}"
+        counts = written_counts(notes)
+        if kind == "initialize":
+            if error or counts is None:
+                return f"Last Initialize: {clock} · Failed · {duration}"
+            loaded = counts[0] + counts[1]
+            return f"Last Initialize: {clock} · {loaded:,} rows loaded · {duration}"
+        if error or counts is None:
+            return f"Last Sync: {clock} · Failed · {duration}"
+        new, updated = counts
+        return f"Last Sync: {clock} · +{new:,} new / {updated:,} updated · {duration}"
 
     def _append_log(self, line: str) -> None:
         if "ERROR" in line:
@@ -2317,7 +2606,6 @@ class BitVaultApp(tk.Tk):
             self._show_metrics(DashboardMetrics(), Enrichment())
             self._render_active_view()
             self.log("No bitvault.db yet. Click Initialize Database to create the schema and load history.")
-            self.status_var.set("Ready. Click Initialize Database to load history.")
             return
         conn = connect()
         try:
@@ -2332,7 +2620,6 @@ class BitVaultApp(tk.Tk):
                 self._show_metrics(DashboardMetrics(), Enrichment())
                 self._render_active_view()
                 self.log("bitvault.db has no hourly_klines table yet. Click Initialize Database.")
-                self.status_var.set("Ready. Click Initialize Database to create the tables.")
                 return
             metrics = load_metrics(conn, self.log)
             enrichment = load_enrichment(conn)
@@ -2354,14 +2641,6 @@ class BitVaultApp(tk.Tk):
             conn.close()
         self._show_metrics(metrics, enrichment)
         self._render_active_view()
-        if metrics.btc_count and metrics.btc_first is not None and metrics.btc_last is not None:
-            self.status_var.set(
-                f"Ready · BTCUSDT {metrics.btc_count:,} hourly rows · "
-                f"first {format_utc_label(metrics.btc_first)} · "
-                f"last {format_utc_label(metrics.btc_last)}"
-            )
-        else:
-            self.status_var.set("Ready. BTCUSDT hourly_klines is empty.")
 
     def _show_metrics(self, metrics: DashboardMetrics, enrichment: Enrichment) -> None:
         self.count_value.configure(text=f"{metrics.btc_count:,}")
