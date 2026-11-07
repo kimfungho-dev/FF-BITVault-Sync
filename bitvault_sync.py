@@ -814,10 +814,11 @@ class DashboardMetrics:
     btc_last: int | None = None
     eth_count: int = 0
     fear_greed_count: int = 0
+    symbol_count: int = 0
 
     @property
     def all_tables(self) -> int:
-        return self.btc_count + self.eth_count + self.fear_greed_count
+        return self.btc_count + self.eth_count + self.fear_greed_count + self.symbol_count
 
 
 def load_metrics(conn: sqlite3.Connection, log: LogFn | None = None) -> DashboardMetrics:
@@ -830,12 +831,15 @@ def load_metrics(conn: sqlite3.Connection, log: LogFn | None = None) -> Dashboar
     eth_count = int(c.fetchone()[0])
     c.execute("SELECT COUNT(*) FROM daily_fear_greed")
     fear_greed_count = int(c.fetchone()[0])
+    c.execute("SELECT COUNT(*) FROM symbols")
+    symbol_count = int(c.fetchone()[0])
     return DashboardMetrics(
         btc_count=int(btc_count or 0),
         btc_first=btc_first,
         btc_last=btc_last,
         eth_count=eth_count,
         fear_greed_count=fear_greed_count,
+        symbol_count=symbol_count,
     )
 
 
@@ -1138,8 +1142,6 @@ def ensure_continuous(
         "Backfilling only those hours."
     )
     ranges = group_contiguous(missing)
-    if len(ranges) > 20:
-        ranges = [(missing[0], missing[-1])]
     for range_start, range_end in ranges:
         _absorb(
             repaired,
@@ -1920,7 +1922,7 @@ class BitVaultApp(tk.Tk):
         super().__init__()
         self.title("FF-BITVault-Sync — Quantitative Crypto Data Warehouse")
         self.configure(bg=BG)
-        self.minsize(1280, 860)
+        self.minsize(1100, 700)
         ui_choices, mono_choices = platform_font_choices()
         self.ui_font = choose_font(self, ui_choices, "TkDefaultFont")
         self.mono_font = choose_font(self, mono_choices, "TkFixedFont")
@@ -1948,11 +1950,12 @@ class BitVaultApp(tk.Tk):
         self.update_idletasks()
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-        width = min(1480, max(1280, screen_w - 80))
-        height = min(1100, max(900, screen_h - 80))
+        width = min(max(screen_w - 40, 1), 1480)
+        height = min(max(screen_h - 80, 1), 1100)
         x = max(0, (screen_w - width) // 2)
         y = max(0, (screen_h - height) // 2)
         self.geometry(f"{width}x{height}+{x}+{y}")
+        self.after_idle(self._fit_timestamp_cards)
 
     def _apply_theme(self) -> None:
         style = ttk.Style(self)
@@ -2281,10 +2284,10 @@ class BitVaultApp(tk.Tk):
             metrics, 0, "Total Row Count", GOLD, "0", 24
         )
         self.first_value, self.first_sub = self._metric_card(
-            metrics, 1, "First Record Timestamp", TEAL, "—", 14
+            metrics, 1, "First Record Timestamp", TEAL, "—", 11
         )
         self.last_value, self.last_sub = self._metric_card(
-            metrics, 2, "Last Record Timestamp", BLUE, "—", 14
+            metrics, 2, "Last Record Timestamp", BLUE, "—", 11
         )
         self.health_value, self.health_sub = self._metric_card(
             metrics, 3, "Warehouse Enrichment & Health", "#c4b5fd", "—", 18
@@ -2344,9 +2347,11 @@ class BitVaultApp(tk.Tk):
         self.tree.tag_configure("regime_neutral", background="#241c10", foreground=AMBER)
         self.tree.tag_configure("live", foreground=AMBER)
         table_scroll = ttk.Scrollbar(table_wrap, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=table_scroll.set)
+        table_xscroll = ttk.Scrollbar(table_wrap, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=table_scroll.set, xscrollcommand=table_xscroll.set)
         self.tree.grid(row=1, column=0, sticky="nsew")
         table_scroll.grid(row=1, column=1, sticky="ns")
+        table_xscroll.grid(row=2, column=0, sticky="ew")
 
         self.log_toggle = tk.Label(
             shell,
@@ -2878,13 +2883,13 @@ class BitVaultApp(tk.Tk):
         self._render_active_view()
 
     def _show_metrics(self, metrics: DashboardMetrics, enrichment: Enrichment) -> None:
-        self.count_value.configure(text=f"{metrics.btc_count:,}")
+        self.count_value.configure(text=f"{metrics.all_tables:,}")
         self.count_sub.configure(
             text=(
                 f"BTCUSDT klines: {metrics.btc_count:,}\n"
                 f"ETHUSDT klines: {metrics.eth_count:,}\n"
                 f"Fear & Greed: {metrics.fear_greed_count:,}\n"
-                f"All tables: {metrics.all_tables:,}"
+                f"symbols: {metrics.symbol_count:,}"
             )
         )
         self.first_value.configure(text=format_utc_label(metrics.btc_first))
@@ -2907,6 +2912,16 @@ class BitVaultApp(tk.Tk):
                 f"Continuity: {continuity_label(enrichment.missing_hours)}"
             )
         )
+
+    def _fit_timestamp_cards(self) -> None:
+        """Keep the full UTC suffix inside the First and Last cards."""
+        if self._closing:
+            return
+        self.update_idletasks()
+        for label in (self.first_value, self.last_value, self.first_sub, self.last_sub):
+            inner = label.winfo_width()
+            if inner > 20:
+                label.configure(wraplength=inner)
 
     def _on_view_change(self) -> None:
         self._render_active_view()

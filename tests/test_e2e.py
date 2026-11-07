@@ -820,6 +820,9 @@ def test_10_action_label_is_local_and_stored_timestamps_are_utc(
                 (bv.PRIMARY_SYMBOL,),
             ).fetchone()
             count, _, _ = _counts(conn, bv.PRIMARY_SYMBOL)
+            eth_count, _, _ = _counts(conn, bv.BENCHMARK_SYMBOL)
+            fear_count = int(conn.execute("SELECT COUNT(*) FROM daily_fear_greed").fetchone()[0])
+            symbol_count = int(conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0])
         finally:
             conn.close()
 
@@ -829,7 +832,11 @@ def test_10_action_label_is_local_and_stored_timestamps_are_utc(
         stamped = datetime.fromtimestamp(int(open_time) / 1000, tz=timezone.utc)
         assert stamped == datetime(2026, 9, 1, tzinfo=timezone.utc)
         assert app.first_value.cget("text") == "2026-09-01 00:00:00 UTC"
-        assert app.count_value.cget("text") == f"{count:,}"
+        total_rows = count + eth_count + fear_count + symbol_count
+        assert app.count_value.cget("text") == f"{total_rows:,}"
+        breakdown = app.count_sub.cget("text")
+        assert f"BTCUSDT klines: {count:,}" in breakdown
+        assert f"symbols: {symbol_count:,}" in breakdown
         print(
             f"TEST10 action_clock={clock!r} status={status!r} "
             f"stored_open_time={open_time} stored_open_datetime={open_datetime!r} "
@@ -1029,3 +1036,62 @@ def test_15_sync_and_autosync_disabled_until_initialized(
     assert app.auto_sync_var.get() is False
     assert "[AUTO-SYNC] Turned off: database is not initialized." in app.log_text.get("1.0", "end")
     print("TEST15 sync and auto-sync disabled until initialize, then enabled")
+
+
+def _hours_covered(params: dict) -> list[int]:
+    start = int(params["startTime"])
+    end = params.get("endTime")
+    if end is None:
+        return [start]
+    cursor = start
+    hours: list[int] = []
+    while cursor <= int(end):
+        hours.append(cursor)
+        cursor += HOUR
+    return hours
+
+
+def test_16_twenty_one_holes_request_only_missing_hours(monkeypatch: pytest.MonkeyPatch) -> None:
+    """21 separate holes are filled without rewriting the hours already stored."""
+    now = HISTORY + 100 * HOUR
+    holes = [HISTORY + (2 + 4 * index) * HOUR for index in range(21)]
+    assert holes[-1] < now
+    market = Market(now)
+    market.install(monkeypatch)
+    conn = bv.connect()
+    try:
+        bv.initialize_database(conn, lambda _message: None)
+        before = {
+            symbol: _counts(conn, symbol)[0]
+            for symbol in (bv.PRIMARY_SYMBOL, bv.BENCHMARK_SYMBOL)
+        }
+        for symbol in (bv.PRIMARY_SYMBOL, bv.BENCHMARK_SYMBOL):
+            conn.executemany(
+                "DELETE FROM hourly_klines WHERE symbol = ? AND open_time = ?",
+                [(symbol, open_time) for open_time in holes],
+            )
+        conn.commit()
+        market.calls.clear()
+        notes: list[str] = []
+        bv.incremental_sync(conn, notes.append)
+        for symbol in (bv.PRIMARY_SYMBOL, bv.BENCHMARK_SYMBOL):
+            count, _, last = _counts(conn, symbol)
+            assert count == before[symbol]
+            assert last == now
+            assert bv.missing_open_times(conn, symbol, HISTORY, now) == []
+            updated = 0
+            for note in notes:
+                if note.startswith(f"COMMIT hourly_klines symbol={symbol} "):
+                    updated += int(note.split("updated=")[1])
+            assert updated <= len(holes) + 1
+            requested: list[int] = []
+            for call in market.calls:
+                if "klines" not in call["url"] or call["params"].get("symbol") != symbol:
+                    continue
+                requested.extend(_hours_covered(call["params"]))
+            allowed = set(holes) | {now}
+            assert set(requested) <= allowed
+            assert set(holes) <= set(requested)
+    finally:
+        conn.close()
+    print(f"TEST16 holes={len(holes)} requested_only_missing updated_within_cap")

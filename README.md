@@ -2,56 +2,46 @@
 
 Source code: https://github.com/kimfungho-dev/FF-BITVault-Sync
 
-Quantitative crypto data warehouse terminal. It ingests hourly BTCUSDT and ETHUSDT spot candles — OHLCV, quote volume, trade count, and taker buy flow — plus the daily Crypto Fear & Greed index, and keeps the warehouse current without downloading the history again.
+## What this is
 
-## Quick Start
+FF-BITVault-Sync is a desktop warehouse for hourly BTCUSDT and ETHUSDT spot candles (OHLCV, quote volume, trade count, and taker buy flow) plus the daily Crypto Fear & Greed index. It stores them in a local SQLite file, `bitvault.db`. No API key is required.
 
-- Option A (download): clone with `git clone https://github.com/kimfungho-dev/FF-BITVault-Sync.git` then `cd FF-BITVault-Sync`
-- Install: `pip install -r requirements.txt` (Windows: `py -m pip install -r requirements.txt`)
-- Run: `python3 bitvault_sync.py` (Windows: `py bitvault_sync.py`)
-- First launch: click "Initialize Database" once; afterwards use "Sync Database"
-- No API keys are required
+The window title is **FF-BITVault-Sync — Quantitative Crypto Data Warehouse**. The header logo reads **FF-BITVAULT-SYNC**.
 
-The desktop window is branded as **FF-BITVault-Sync — Quantitative Crypto Data Warehouse**. The header logo reads **FF-BITVAULT-SYNC**.
-
-The application is one file, `bitvault_sync.py`. SQLite and the desktop UI come from the Python standard library (`sqlite3`, `tkinter`, `tkinter.ttk`). HTTP and validation use `requests` and `pydantic`.
-
-## Requirements
+## What you need
 
 - Python 3.10 or newer
-- `requests`
-- `pydantic`
-- SQLite and Tkinter, both included with a standard CPython install (on Windows, leave **tcl/tk and IDLE** checked in the python.org installer)
+- An internet connection the first time you load history, and again when you sync
+- Tkinter, which ships with python.org builds. On Linux install it if the window does not open: `sudo apt install python3-tk`
+- On Windows, leave **tcl/tk and IDLE** checked in the python.org installer
 
-Install the third-party packages from the project folder:
+The submitted folder is three files: `bitvault_sync.py`, `README.md`, and `requirements.txt`. You do not need git to run it.
 
-```bash
-python3 -m pip install -r requirements.txt
-```
+## Run in 3 steps
 
-## Install and run
-
-From the project folder on macOS or Linux:
+From the folder that contains those three files:
 
 ```bash
-python3 -m pip install -r requirements.txt
+pip install -r requirements.txt
 python3 bitvault_sync.py
 ```
 
-The program changes its working directory to the folder that contains `bitvault_sync.py`, then opens `bitvault.db` in that folder. Launching it from another directory still writes the database next to the script.
+On Windows, use `py -m pip install -r requirements.txt` and `py bitvault_sync.py`.
 
-On a python.org macOS install, if HTTPS calls fail with a certificate error, run **Install Certificates.command** from the Python folder in Applications, then start the app again. `requests` also uses the CA bundle installed with `certifi`.
+Then click **Initialize Database** once. When that finishes, use **Sync Database** for later updates. Sync does not download the history again.
 
-## Running on Windows
+The program writes `bitvault.db` next to `bitvault_sync.py`, even if you started it from another folder. On a python.org macOS install, if HTTPS fails with a certificate error, run **Install Certificates.command** from the Python folder in Applications and start the app again.
 
-Install Python from [python.org/downloads](https://www.python.org/downloads/). In the installer, leave **tcl/tk and IDLE** checked so Tkinter is included. Open a command prompt in the project folder and run:
+## Run in VS Code
 
-```bat
-py -m pip install -r requirements.txt
-py bitvault_sync.py
-```
+1. **File → Open Folder** and choose the folder that contains `bitvault_sync.py`.
+2. **Python: Select Interpreter** and pick Python 3.10 or newer (Command Palette, or the interpreter name in the status bar).
+3. Open a terminal (**Terminal → New Terminal**) and run `pip install -r requirements.txt`.
+4. Open `bitvault_sync.py` and choose **Run → Run Python File**.
 
-`py` is the Python launcher installed with python.org builds. The window uses Segoe UI and Consolas on Windows, and DejaVu Sans and DejaVu Sans Mono on Linux. If a face is not installed, Tk falls back to its default UI and fixed fonts. The database file is still `bitvault.db` next to `bitvault_sync.py`.
+If the terminal says `ModuleNotFoundError: No module named 'requests'` or `No module named 'pydantic'`, the Run button is using a different interpreter from the one that received `pip install`. Select that same interpreter, install again, and run the file once more.
+
+If Python starts and no window appears, Tkinter is missing. On Linux run `sudo apt install python3-tk`. On Windows, reinstall Python from python.org with **tcl/tk and IDLE** checked. Then run the file again.
 
 ## Button behaviour
 
@@ -69,8 +59,8 @@ If `hourly_klines` does not exist, or BTCUSDT has no rows, Sync makes no kline r
 
 A badge beside the buttons reads SQLite when the window opens and again after every job:
 
-- Red `● Not initialized — click Initialize Database first` when `hourly_klines` is missing or BTCUSDT has 0 rows.
-- Green `● Initialized · <N> BTCUSDT rows · use Sync Database for updates` otherwise.
+- Red `● Not initialized` when `hourly_klines` is missing or BTCUSDT has 0 rows.
+- Green `● Initialized · <N> rows` otherwise. `<N>` is the BTCUSDT hourly row count.
 
 ## Candle status
 
@@ -114,7 +104,7 @@ Five primary controls stay on screen with these exact labels:
 | --- | --- |
 | **Initialize Database** | Creates the tables and indexes, then downloads the full hourly history in pages of 1000. Runs on a background thread. |
 | **Sync Database** | Reads `MAX(open_time)` for `BTCUSDT` and downloads only that candle plus any hours that have opened since. |
-| **Total Row Count** | Number of `BTCUSDT` rows in `hourly_klines`, with a breakdown of BTCUSDT klines, ETHUSDT klines, Fear & Greed rows, and the sum of all three tables. |
+| **Total Row Count** | The big number is every stored record: `symbols` + `hourly_klines` + `daily_fear_greed`. The lines under it break that into BTCUSDT klines, ETHUSDT klines, Fear & Greed, and symbols. |
 | **First Record Timestamp** | UTC open time of the earliest `BTCUSDT` candle, `YYYY-MM-DD HH:MM:SS UTC`. |
 | **Last Record Timestamp** | UTC open time of the latest `BTCUSDT` candle, including the hour that is still forming. |
 
@@ -259,13 +249,13 @@ CREATE INDEX IF NOT EXISTS idx_fear_greed_date ON daily_fear_greed (date_str);
 
 If Alternative.me cannot be reached, daily BTCUSDT funding rates are aggregated to one row per UTC day. `value` is then `funding_rate × 1,000,000` (so a rate of `0.0001` is stored as `100`) and `value_classification` is prefixed with `Funding fallback (BTCUSDT)`. If funding history also fails, one row is stored from the spot 24-hour ticker and labelled `Ticker 24h fallback`. The next successful Fear & Greed load upserts the real index back onto that date. Kline loading still finishes when every sentiment source fails; the failure is written to the log.
 
-Dashboard totals come from:
+**Total Row Count** adds four `COUNT(*)` results: BTCUSDT hourly rows, ETHUSDT hourly rows, Fear & Greed days, and `symbols`. First and Last Record Timestamp still come from:
 
 ```sql
 SELECT COUNT(*), MIN(open_time), MAX(open_time) FROM hourly_klines WHERE symbol = 'BTCUSDT';
 ```
 
-ETHUSDT and Fear & Greed counts are separate `COUNT(*)` queries. The market view joins ETHUSDT onto BTCUSDT on `open_time` and keeps the newest 15 Bitcoin hours, including quote volume and taker-buy base volume so the terminal can show quote turnover and taker share.
+The market view joins ETHUSDT onto BTCUSDT on `open_time` and keeps the newest 15 Bitcoin hours, including quote volume and taker-buy base volume so the terminal can show quote turnover and taker share. A horizontal scrollbar under the grid reaches the Status column when the window is narrower than the column set.
 
 ## How a full load works
 
@@ -310,7 +300,7 @@ Fetching the whole history on every refresh is the wrong implementation. **Sync 
 5. `ON CONFLICT(symbol, open_time) DO UPDATE` writes the fresh OHLC and volume for the overlapping hour. New hours are inserted. The log then reports `new` and `updated` separately. `new` is the change in `COUNT(*)`. `updated` is the rest of the batch.
 6. ETHUSDT is synced from its own `MAX(open_time)`. If that symbol is missing, only ETHUSDT is loaded from the history start. BTCUSDT is not downloaded again.
 7. Fear & Greed uses `SELECT MAX(timestamp)` and requests only the overlapping day plus any newer days (`limit` is the number of elapsed days plus two). The full `limit=0` history is reserved for the first load.
-8. A local gap check walks open times from the first stored hour through the Binance server hour. Only missing hours are requested. If the exchange hour is still missing after that fetch, those hours stay in the log and the line is not `Continuity OK`. A clean database makes no extra kline call here.
+8. A local gap check walks open times from the first stored hour through the Binance server hour. Each contiguous run of missing hours is its own request, with that run's `startTime` and `endTime`. Hours already stored are not included, even when there are many separate holes. If the exchange hour is still missing after that fetch, those hours stay in the log and the line is not `Continuity OK`. A clean database makes no extra kline call here.
 
 After a sync inside the same clock hour, the BTCUSDT row count stays the same, `updated` is 1, and `new` is 0, while the latest close and volume can change. After an hour boundary, `new` is 1 (or more, if several hours were skipped) and the previous hour is the updated row.
 
@@ -325,21 +315,26 @@ After a sync inside the same clock hour, the BTCUSDT row count stays the same, `
 
 The activity log is plain text. Select it and copy if you want to attach it to a report.
 
-## Tests
+## Known limitations
+
+- Quote notionals (`quote_asset_volume` and `taker_buy_quote_volume`) are stored as SQLite `REAL`. A value near 1e8 can differ from Binance's 8-decimal string by `1e-8`, because float64 cannot hold 17 significant digits. Open, high, low, close, and base volume round-trip exactly.
+- `open_datetime` is a display copy of `open_time`, written as `YYYY-MM-DD HH:MM:SS` UTC when the candle is stored. It is determined by `open_time`.
+- **C9.** Closing the window does not wait for the background worker. The thread is a daemon, so a commit in progress can be interrupted at process exit. SQLite rolls the page back.
+- **C10.** Candles that fall outside the requested window are dropped without a count in the log. Validation failures are still logged one by one.
+- **C11.** `read_init_state` treats any SQLite error as "not initialized". A locked or unreadable file can look empty.
+- **C12.** The Windows font list is Segoe UI and Consolas, then Tk's default faces. A machine without those faces does not try Arial, Tahoma, or Courier New first.
+
+## For developers (GitHub repo only)
+
+Source code: https://github.com/kimfungho-dev/FF-BITVault-Sync
+
+`tests/` and `requirements-dev.txt` are not part of the 3-file submission (`bitvault_sync.py`, `README.md`, `requirements.txt`). They are only in the GitHub repository.
 
 ```bash
+git clone https://github.com/kimfungho-dev/FF-BITVault-Sync.git
+cd FF-BITVault-Sync
 pip install -r requirements-dev.txt
 python3 -m pytest tests/ -v
 ```
 
 The suite uses a temporary database. It does not read or replace `bitvault.db` next to the script.
-
-## Known limitations
-
-These are recorded as future work. They are not part of the current sync design.
-
-- **C6.** When more than 20 separate gap ranges are found, the repair request covers the whole span from the first hole to the last. Hours that are already stored inside that span can be requested again.
-- **C9.** Closing the window does not wait for the background worker. The thread is a daemon, so a commit in progress can be interrupted at process exit. SQLite rolls the page back.
-- **C10.** Candles that fall outside the requested window are dropped without a count in the log. Validation failures are still logged one by one.
-- **C11.** `read_init_state` treats any SQLite error as "not initialized". A locked or unreadable file can look empty.
-- **C12.** The Windows font list is Segoe UI and Consolas, then Tk's default faces. A machine without those faces does not try Arial, Tahoma, or Courier New first.
