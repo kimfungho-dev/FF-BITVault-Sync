@@ -1,0 +1,4 @@
+bitvault.db
+bitvault_backup.db
+__pycache__/
+.DS_Store
