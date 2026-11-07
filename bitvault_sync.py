@@ -44,11 +44,20 @@ KLINE_LIMIT = 1000
 REQUEST_TIMEOUT_SECONDS = 15
 AUTO_SYNC_INTERVAL_MS = 5 * 60 * 1000
 
+BINANCE_HOSTS = (
+    "https://api.binance.com",
+    "https://data-api.binance.vision",
+)
 BINANCE_TIME_URL = "https://api.binance.com/api/v3/time"
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 BINANCE_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"
 FEAR_GREED_URL = "https://api.alternative.me/fng/"
+SPOT_PATHS = ("/api/v3/time", "/api/v3/klines", "/api/v3/ticker/24hr")
+# Session memory: the last spot host that answered. 451/403 and connection
+# failures move the next call to the other host.
+_session_host = BINANCE_HOSTS[0]
+LAST_SERVER_TIME_MS: int | None = None
 
 PRIMARY_SYMBOL = "BTCUSDT"
 BENCHMARK_SYMBOL = "ETHUSDT"
@@ -362,8 +371,19 @@ def _request_json(url: str, params: dict, log: LogFn) -> object:
     return body
 
 
-def request_json(url: str, params: dict, log: LogFn) -> object:
-    """Call `_request_json`, retrying rate limits and transient network errors."""
+def _spot_path(url: str) -> str | None:
+    for path in SPOT_PATHS:
+        if url.endswith(path):
+            return path
+    return None
+
+
+def _request_with_same_host_retries(url: str, params: dict, log: LogFn) -> object:
+    """Retry rate limits and connection errors on one host.
+
+    HTTP 451 and 403 are not in this set. The spot host loop handles those
+    by moving the same path to the next host.
+    """
     retry_statuses = {418, 429, 500, 502, 503, 504}
     last_error: Exception | None = None
     for attempt in range(1, 4):
@@ -385,20 +405,63 @@ def request_json(url: str, params: dict, log: LogFn) -> object:
     raise RuntimeError(f"request failed: {last_error}")
 
 
+def _request_spot(path: str, params: dict, log: LogFn) -> object:
+    """Try the session host, then the other public host, for one spot path."""
+    global _session_host
+    ordered = [_session_host] + [host for host in BINANCE_HOSTS if host != _session_host]
+    last_error: Exception | None = None
+    for index, host in enumerate(ordered):
+        if index > 0 and host == "https://data-api.binance.vision":
+            log("[HOST] switched to data-api.binance.vision")
+        url = f"{host}{path}"
+        try:
+            body = _request_with_same_host_retries(url, params, log)
+        except requests.HTTPError as exc:
+            last_error = exc
+            status = exc.response.status_code if exc.response is not None else None
+            if status in {403, 451} and index < len(ordered) - 1:
+                continue
+            raise
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            if index < len(ordered) - 1:
+                continue
+            raise
+        _session_host = host
+        return body
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"request failed for {path}")
+
+
+def request_json(url: str, params: dict, log: LogFn) -> object:
+    """Call `_request_json`, retrying rate limits and transient network errors.
+
+    Spot `/api/v3/time`, `/api/v3/klines`, and `/api/v3/ticker/24hr` walk
+    `BINANCE_HOSTS` when the current host returns 451/403 or cannot be reached.
+    """
+    path = _spot_path(url)
+    if path is None:
+        return _request_with_same_host_retries(url, params, log)
+    return _request_spot(path, params, log)
+
+
 def fetch_server_time_ms(log: LogFn) -> int:
+    global LAST_SERVER_TIME_MS
     params: dict = {}
     try:
         payload = request_json(BINANCE_TIME_URL, params, log)
         if not isinstance(payload, dict) or "serverTime" not in payload:
             raise ValueError(f"unexpected time payload: {payload!r}")
-        return _as_int(payload["serverTime"])
+        server_ms = _as_int(payload["serverTime"])
     except (requests.RequestException, ValueError, TypeError) as exc:
-        local_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        server_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         log(
             f"WARNING: Binance server time is unavailable ({exc}). "
-            f"Using the local UTC clock {format_utc_label(local_ms)}."
+            f"Using the local UTC clock {format_utc_label(server_ms)}."
         )
-        return local_ms
+    LAST_SERVER_TIME_MS = server_ms
+    return server_ms
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +516,16 @@ CREATE TABLE IF NOT EXISTS daily_fear_greed (
 SQL_INDEX_FEAR_GREED_DATE = (
     "CREATE INDEX IF NOT EXISTS idx_fear_greed_date ON daily_fear_greed (date_str)"
 )
+SQL_DEDUPE_FEAR_DATES = """
+DELETE FROM daily_fear_greed
+WHERE timestamp NOT IN (
+    SELECT MAX(timestamp) FROM daily_fear_greed GROUP BY date_str
+)
+"""
+SQL_UNIQUE_FEAR_DATE = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_fear_greed_date "
+    "ON daily_fear_greed(date_str)"
+)
 
 SQL_UPSERT_SYMBOL = """
 INSERT INTO symbols (symbol, base_asset, quote_asset, market_type)
@@ -487,8 +560,8 @@ ON CONFLICT(symbol, open_time) DO UPDATE SET
 SQL_UPSERT_FEAR_GREED = """
 INSERT INTO daily_fear_greed (timestamp, date_str, value, value_classification)
 VALUES (?, ?, ?, ?)
-ON CONFLICT(timestamp) DO UPDATE SET
-    date_str = excluded.date_str,
+ON CONFLICT(date_str) DO UPDATE SET
+    timestamp = excluded.timestamp,
     value = excluded.value,
     value_classification = excluded.value_classification
 """
@@ -549,7 +622,7 @@ LIMIT 1
 
 
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect("bitvault.db")
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("PRAGMA foreign_keys = ON")
     c.execute("PRAGMA busy_timeout = 5000")
@@ -568,6 +641,8 @@ def create_schema(conn: sqlite3.Connection, log: LogFn) -> None:
         SQL_INDEX_KLINES_SYMBOL,
         SQL_CREATE_FEAR_GREED,
         SQL_INDEX_FEAR_GREED_DATE,
+        SQL_DEDUPE_FEAR_DATES,
+        SQL_UNIQUE_FEAR_DATE,
     )
     # table_exists is defined just below. A repeat sync should not reprint the DDL.
     fresh = not table_exists(conn, "hourly_klines")
@@ -681,7 +756,7 @@ def upsert_fear_greed(
     log(
         "SQL: executemany INSERT INTO daily_fear_greed "
         "(timestamp, date_str, value, value_classification) "
-        "VALUES (?, ?, ?, ?) ON CONFLICT(timestamp) DO UPDATE SET ... "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(date_str) DO UPDATE SET ... "
         f"| rows={len(rows)}"
     )
     c.executemany(SQL_UPSERT_FEAR_GREED, rows)
@@ -790,7 +865,9 @@ def load_enrichment(conn: sqlite3.Connection) -> Enrichment:
         if first is None or last is None:
             continue
         have_klines = True
-        missing += len(missing_open_times(conn, symbol, int(first), int(last)))
+        horizon = floor_hour(LAST_SERVER_TIME_MS) if LAST_SERVER_TIME_MS else floor_hour(utc_now_ms())
+        end_ms = max(int(last), horizon)
+        missing += len(missing_open_times(conn, symbol, int(first), end_ms))
     return Enrichment(
         fear_value=None if fear is None else int(fear[0]),
         fear_class=None if fear is None else str(fear[1]),
@@ -937,6 +1014,20 @@ def fetch_and_store_klines(
     return total
 
 
+def _require_stored_klines(conn: sqlite3.Connection, log: LogFn) -> None:
+    """Fail the job when a tracked symbol stored nothing."""
+    c = conn.cursor()
+    empty: list[str] = []
+    for symbol in (PRIMARY_SYMBOL, BENCHMARK_SYMBOL):
+        c.execute("SELECT COUNT(*) FROM hourly_klines WHERE symbol = ?", (symbol,))
+        if int(c.fetchone()[0] or 0) == 0:
+            empty.append(symbol)
+            log(f"ERROR: {symbol} ended with 0 hourly rows stored.")
+    if empty:
+        joined = ", ".join(empty)
+        raise RuntimeError(f"{joined} ended with 0 hourly rows stored.")
+
+
 def _absorb(total: SyncCounts, extra: SyncCounts) -> None:
     total.api_rows += extra.api_rows
     total.inserted += extra.inserted
@@ -988,11 +1079,14 @@ def ensure_continuous(
             last = int(refreshed)
 
     audit_from = expected_start if first > expected_start else first
-    missing = missing_open_times(conn, symbol, audit_from, last)
+    # Audit through the exchange hour, not only the last stored candle. A tail
+    # the API did not return must stay missing and must not log Continuity OK.
+    audit_end = max(last, latest_hour)
+    missing = missing_open_times(conn, symbol, audit_from, audit_end)
     if not missing:
         log(
             f"Continuity OK {symbol}: no missing hours from "
-            f"{format_utc_label(audit_from)} to {format_utc_label(last)}."
+            f"{format_utc_label(audit_from)} to {format_utc_label(audit_end)}."
         )
         return repaired
 
@@ -1023,7 +1117,7 @@ def ensure_continuous(
                 end_ms=range_end,
             ),
         )
-    remaining = missing_open_times(conn, symbol, audit_from, last)
+    remaining = missing_open_times(conn, symbol, audit_from, audit_end)
     if remaining:
         log(
             f"WARNING: {symbol} still missing {len(remaining)} hours after backfill. "
@@ -1190,6 +1284,7 @@ def initialize_database(
     progress(88, "Fetching the Crypto Fear & Greed index...")
     sentiment, source = load_sentiment(start_ms, log, limit=0)
     fear = upsert_fear_greed(conn, sentiment, log)
+    _require_stored_klines(conn, log)
     progress(100, "Initialize complete.")
     log(
         "[INITIALIZE] Complete. "
@@ -1299,6 +1394,7 @@ def incremental_sync(
     _absorb(btc, ensure_continuous(conn, PRIMARY_SYMBOL, start_ms, server_time_ms, log))
     _absorb(eth, ensure_continuous(conn, BENCHMARK_SYMBOL, start_ms, server_time_ms, log))
 
+    _require_stored_klines(conn, log)
     progress(100, "Incremental sync complete.")
     log(
         "[INCREMENTAL SYNC] Synced "
@@ -1364,7 +1460,15 @@ SELECT
 FROM hourly_klines AS b
 LEFT JOIN hourly_klines AS e
     ON e.symbol = ? AND e.open_time = b.open_time
-LEFT JOIN daily_fear_greed AS g
+LEFT JOIN (
+    SELECT date_str, value, value_classification
+    FROM daily_fear_greed AS picked
+    WHERE timestamp = (
+        SELECT MAX(latest.timestamp)
+        FROM daily_fear_greed AS latest
+        WHERE latest.date_str = picked.date_str
+    )
+) AS g
     ON g.date_str = substr(b.open_datetime, 1, 10)
 WHERE b.symbol = ?
 ORDER BY b.open_time
@@ -1429,7 +1533,27 @@ def verify_integrity(conn: sqlite3.Connection, log: LogFn) -> str:
             f"[VERIFY] gap symbol={symbol} open_time={open_time} "
             f"next_open={next_open} delta={int(next_open) - int(open_time)}"
         )
-    if gaps:
+    horizon = floor_hour(fetch_server_time_ms(log))
+    for symbol in (PRIMARY_SYMBOL, BENCHMARK_SYMBOL):
+        c.execute(
+            "SELECT MIN(open_time), MAX(open_time) FROM hourly_klines WHERE symbol = ?",
+            (symbol,),
+        )
+        first_open, last_open = c.fetchone()
+        if first_open is None or last_open is None:
+            continue
+        tail = [
+            open_time
+            for open_time in missing_open_times(conn, symbol, int(first_open), horizon)
+            if open_time > int(last_open)
+        ]
+        if tail:
+            gap_counts[symbol] = gap_counts.get(symbol, 0) + len(tail)
+            log(
+                f"[VERIFY] tail symbol={symbol} missing {len(tail)} hours "
+                f"after {format_utc_label(int(last_open))} through {format_utc_label(horizon)}."
+            )
+    if any(gap_counts.values()):
         ok = False
     for symbol in (PRIMARY_SYMBOL, BENCHMARK_SYMBOL):
         lines.append(
@@ -1452,12 +1576,13 @@ def verify_integrity(conn: sqlite3.Connection, log: LogFn) -> str:
             ok = False
             lines.append(f"{symbol}: actual 0, expected 0")
             continue
-        expected = (int(last) - int(first)) // HOUR_MS + 1
+        end_ms = max(int(last), horizon)
+        expected = (end_ms - int(first)) // HOUR_MS + 1
         if expected != actual_n:
             ok = False
         lines.append(
             f"{symbol}: actual {actual_n:,}, expected {expected:,} "
-            f"({format_utc(int(first))} -> {format_utc(int(last))} UTC)"
+            f"({format_utc(int(first))} -> {format_utc(end_ms)} UTC)"
         )
     for symbol in (PRIMARY_SYMBOL, BENCHMARK_SYMBOL):
         if symbol not in seen_symbols:
@@ -1778,6 +1903,8 @@ class BitVaultApp(tk.Tk):
         self._job_kind = ""
         self._job_started = 0.0
         self._verify_report = ""
+        self._export_path = ""
+        self._dialog_open = False
         self._log_open = False
         self._apply_theme()
         self._build()
@@ -2352,7 +2479,12 @@ class BitVaultApp(tk.Tk):
                 "For routine updates use Sync Database, which only fetches new hours. "
                 "Re-run the full historical download anyway?"
             )
-            if not messagebox.askyesno("Initialize Database", prompt, parent=self):
+            self._dialog_open = True
+            try:
+                confirmed = messagebox.askyesno("Initialize Database", prompt, parent=self)
+            finally:
+                self._dialog_open = False
+            if not confirmed:
                 self.log("[INITIALIZE] Skipped by user: database already initialized.")
                 return
         self._start_job(self._initialize_job, "Running: Initialize Database...", "initialize")
@@ -2386,33 +2518,29 @@ class BitVaultApp(tk.Tk):
             messagebox.showinfo("Export CSV", "bitvault.db does not exist yet.", parent=self)
             return
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
-        path = filedialog.asksaveasfilename(
-            parent=self,
-            title="Export CSV",
-            defaultextension=".csv",
-            initialfile=f"ff_bitvault_hourly_{stamp}.csv",
-            filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
-        )
+        self._dialog_open = True
+        try:
+            path = filedialog.asksaveasfilename(
+                parent=self,
+                title="Export CSV",
+                defaultextension=".csv",
+                initialfile=f"ff_bitvault_hourly_{stamp}.csv",
+                filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
+            )
+        finally:
+            self._dialog_open = False
         if not path:
             return
-        self._remember_action("Running: Export CSV...")
-        self._show_progress()
-        self._set_progress(15)
-        self.update_idletasks()
-        try:
-            export_hourly_csv(path, self.log)
-        except OSError as exc:
-            self._hide_progress()
-            self.log(f"ERROR: export failed: {exc}")
-            self._remember_action(f"Last Export: {action_clock()} · Failed")
-            messagebox.showerror("Export CSV", str(exc), parent=self)
-            return
-        self._hide_progress()
-        self._remember_action(f"Last Export: {action_clock()} · {os.path.basename(path)}")
+        self._export_path = path
+        self._start_job(self._export_job, "Running: Export CSV...", "export")
 
     def _on_auto_button(self) -> None:
-        self.auto_sync_var.set(not self.auto_sync_var.get())
+        turning_on = not self.auto_sync_var.get()
+        self.auto_sync_var.set(turning_on)
         self._on_auto_sync_toggle()
+        if turning_on and not self._busy and not self._dialog_open:
+            self.log("[AUTO-SYNC]")
+            self._start_job(self._sync_job, "Running: Sync Database...", "sync")
 
     def _on_auto_sync_toggle(self) -> None:
         if self.auto_sync_var.get():
@@ -2449,6 +2577,9 @@ class BitVaultApp(tk.Tk):
             self._paint_auto_button()
             return
         self._schedule_auto_sync()
+        if self._dialog_open:
+            self.log("[AUTO-SYNC] Skipped: a dialog is open.")
+            return
         if self._busy:
             self.log("[AUTO-SYNC] Skipped: a job is already running.")
             return
@@ -2506,6 +2637,9 @@ class BitVaultApp(tk.Tk):
         self._verify_report = report
         self._queue.put(("dialog", "Verify Integrity", report))
 
+    def _export_job(self) -> None:
+        export_hourly_csv(self._export_path, self.log)
+
     def log(self, message: str) -> None:
         if self._busy:
             self._job_notes.append(message)
@@ -2549,6 +2683,19 @@ class BitVaultApp(tk.Tk):
         self._remember_action(self._action_summary(kind, notes, report, elapsed, error))
         self._paint_auto_button()
         self.refresh_dashboard()
+        if error:
+            if not self._log_open:
+                self._toggle_log()
+            self.after(0, lambda message=error: self._show_error_dialog(message))
+
+    def _show_error_dialog(self, message: str) -> None:
+        if self._closing or not self.winfo_exists():
+            return
+        self._dialog_open = True
+        try:
+            messagebox.showerror("FF-BITVault-Sync", message, parent=self)
+        finally:
+            self._dialog_open = False
 
     def _action_summary(
         self,
@@ -2564,6 +2711,10 @@ class BitVaultApp(tk.Tk):
             if error:
                 return f"Last Integrity Check: {clock} · Failed"
             return f"Last Integrity Check: {clock} · {integrity_headline(report)}"
+        if kind == "export":
+            if error or not self._export_path:
+                return f"Last Export: {clock} · Failed"
+            return f"Last Export: {clock} · {os.path.basename(self._export_path)}"
         counts = written_counts(notes)
         if kind == "initialize":
             if error or counts is None:
@@ -2590,6 +2741,9 @@ class BitVaultApp(tk.Tk):
             tag = "plain"
         self.log_text.configure(state="normal")
         self.log_text.insert("end", line + "\n", tag)
+        line_count = int(float(self.log_text.index("end-1c")))
+        if line_count > 2000:
+            self.log_text.delete("1.0", "501.0")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
@@ -2788,6 +2942,7 @@ class BitVaultApp(tk.Tk):
             "idx_klines_open_time": "hourly_klines (open_time)",
             "idx_klines_symbol": "hourly_klines (symbol)",
             "idx_fear_greed_date": "daily_fear_greed (date_str)",
+            "ux_fear_greed_date": "daily_fear_greed (date_str) UNIQUE",
         }
         for name in self._terminal["indexes"]:
             rows.append((name, "Index", index_detail.get(name, name), "—"))

@@ -83,15 +83,15 @@ Above the grid, while this view is selected: `LIVE = candle still forming; value
 
 ## Auto-Sync
 
-**Auto-Sync every 5 min** sits under the buttons and is off when the window opens. Turning it on arms a Tk `after` timer for 5 minutes and shows `Next auto-sync: HH:MM:SS UTC`. When the timer fires it calls the same incremental sync as **Sync Database** and writes `[AUTO-SYNC]` to the activity log. If a job is already running, that tick is skipped and the next one is scheduled 5 minutes later. Turning the checkbox off cancels the timer.
+**Auto-Sync: OFF** sits to the right of **Sync Database** and is off when the window opens. Turning it on runs one incremental sync immediately, unless a job or a dialog is already open, then arms a Tk `after` timer for 5 minutes. The button reads `Auto-Sync: ON · next HH:MM:SS UTC`. When the timer fires it calls the same incremental sync as **Sync Database** and writes `[AUTO-SYNC]` to the activity log. If a job is already running, or a confirmation dialog is open, that tick is skipped and the next one is scheduled 5 minutes later. Turning it off cancels the timer.
 
 ## Verify Integrity
 
 **Verify Integrity** is the secondary button immediately after **Sync Database**. It runs on the background thread, prints each statement in the activity log, and then opens a message box:
 
 - Duplicate keys: `SELECT symbol, open_time, COUNT(*) FROM hourly_klines GROUP BY symbol, open_time HAVING COUNT(*) > 1`. Expect 0 rows.
-- Gaps, per symbol: a `LEAD(open_time)` window over `hourly_klines`, counting rows where `next_open - open_time != 3600000`. Expect 0.
-- Expected versus actual hourly rows for each symbol, from its first `open_time` to its last: `(last - first) / 3600000 + 1` compared with `COUNT(*)`.
+- Gaps, per symbol: a `LEAD(open_time)` window over `hourly_klines`, counting rows where `next_open - open_time != 3600000`, plus any hours after the last candle through the Binance server hour. Expect 0.
+- Expected versus actual hourly rows for each symbol, from its first `open_time` through the later of the last stored hour and the Binance server hour.
 - Duplicate Fear & Greed dates: `SELECT date_str, COUNT(*) FROM daily_fear_greed GROUP BY date_str HAVING COUNT(*) > 1`. Expect 0.
 
 The check only reads the database. It does not add columns, tables, or rows.
@@ -165,6 +165,10 @@ Binance kline array fields are stored as follows:
 | 10 | Taker buy quote volume | `taker_buy_quote_volume` |
 
 The last four numeric columns are the extra microstructure and order-flow measures kept on the hourly fact table. `open_datetime` is the UTC rendering of `open_time` in the form `YYYY-MM-DD HH:MM:SS`.
+
+## Network fallback
+
+Spot market data is requested from `https://api.binance.com` first. If that host returns HTTP 451 or 403, or the connection fails, the same path is tried on `https://data-api.binance.vision`. The activity log records `[HOST] switched to data-api.binance.vision`, and that host is reused for the rest of the session. The three paths that fail over are `/api/v3/time`, `/api/v3/klines`, and `/api/v3/ticker/24hr`. HTTP 451 and 403 are not retried on the same host. The local clock is used for the history window only after every time host has failed. Funding-rate history stays on `fapi.binance.com`.
 
 ## History window
 
@@ -249,6 +253,8 @@ CREATE TABLE IF NOT EXISTS daily_fear_greed (
 CREATE INDEX IF NOT EXISTS idx_fear_greed_date ON daily_fear_greed (date_str);
 ```
 
+`ux_fear_greed_date` is a unique index on `date_str`. Before it is created, rows that share a date are reduced to the one with the latest `timestamp`. New Fear & Greed rows upsert on `date_str`, so a day cannot fan out into two sentiment rows. The CSV export also joins each hour to that single date row.
+
 `timestamp` is UTC midnight in milliseconds. Alternative.me publishes Unix seconds; the loader multiplies by 1000. `value` for the live index is the published 0–100 score, and `value_classification` is the published label (`Fear`, `Neutral`, `Greed`, and the extreme labels).
 
 If Alternative.me cannot be reached, daily BTCUSDT funding rates are aggregated to one row per UTC day. `value` is then `funding_rate × 1,000,000` (so a rate of `0.0001` is stored as `100`) and `value_classification` is prefixed with `Funding fallback (BTCUSDT)`. If funding history also fails, one row is stored from the spot 24-hour ticker and labelled `Ticker 24h fallback`. The next successful Fear & Greed load upserts the real index back onto that date. Kline loading still finishes when every sentiment source fails; the failure is written to the log.
@@ -304,7 +310,7 @@ Fetching the whole history on every refresh is the wrong implementation. **Sync 
 5. `ON CONFLICT(symbol, open_time) DO UPDATE` writes the fresh OHLC and volume for the overlapping hour. New hours are inserted. The log then reports `new` and `updated` separately. `new` is the change in `COUNT(*)`. `updated` is the rest of the batch.
 6. ETHUSDT is synced from its own `MAX(open_time)`. If that symbol is missing, only ETHUSDT is loaded from the history start. BTCUSDT is not downloaded again.
 7. Fear & Greed uses `SELECT MAX(timestamp)` and requests only the overlapping day plus any newer days (`limit` is the number of elapsed days plus two). The full `limit=0` history is reserved for the first load.
-8. A local gap check walks open times between the first and last stored hour. Only missing hours are requested. A clean database makes no extra kline call here.
+8. A local gap check walks open times from the first stored hour through the Binance server hour. Only missing hours are requested. If the exchange hour is still missing after that fetch, those hours stay in the log and the line is not `Continuity OK`. A clean database makes no extra kline call here.
 
 After a sync inside the same clock hour, the BTCUSDT row count stays the same, `updated` is 1, and `new` is 0, while the latest close and volume can change. After an hour boundary, `new` is 1 (or more, if several hours were skipped) and the previous hour is the updated row.
 
@@ -318,3 +324,13 @@ After a sync inside the same clock hour, the BTCUSDT row count stays the same, `
 6. Click **Sync Database** once more. The same delta behaviour should repeat. The log must not show a second walk from 1 Sep 2026.
 
 The activity log is plain text. Select it and copy if you want to attach it to a report.
+
+## Known limitations
+
+These are recorded as future work. They are not part of the current sync design.
+
+- **C6.** When more than 20 separate gap ranges are found, the repair request covers the whole span from the first hole to the last. Hours that are already stored inside that span can be requested again.
+- **C9.** Closing the window does not wait for the background worker. The thread is a daemon, so a commit in progress can be interrupted at process exit. SQLite rolls the page back.
+- **C10.** Candles that fall outside the requested window are dropped without a count in the log. Validation failures are still logged one by one.
+- **C11.** `read_init_state` treats any SQLite error as "not initialized". A locked or unreadable file can look empty.
+- **C12.** The Windows font list is Segoe UI and Consolas, then Tk's default faces. A machine without those faces does not try Arial, Tahoma, or Courier New first.
